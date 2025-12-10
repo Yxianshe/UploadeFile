@@ -1,0 +1,5 @@
+paramiko>=3.0.0
+cryptography>=41.0.0
+
+# 注意：Tkinter 通常包含在 Python 安装包中。
+# 如果在某些 Linux 发行版(如 Ubuntu)上报错，请运行: sudo apt-get install python3-tk
