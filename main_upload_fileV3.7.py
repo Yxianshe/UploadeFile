@@ -28,7 +28,7 @@ FONTS = {
     "main": ("Microsoft YaHei UI", 10), "bold": ("Microsoft YaHei UI", 10, "bold"),
     "code": ("Consolas", 10), "status": ("Microsoft YaHei UI", 12, "bold"), "cmd": ("Consolas", 11)
 }
-HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".sftp_uploader_history.json") #用户主目录 路径存储
+HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".sftp_uploader_history.json")
 
 class ModernButton(tk.Canvas):
     def __init__(self, parent, text, command=None, width=120, height=40, radius=20, bg_color=COLORS["accent"], hover_color=COLORS["accent_hover"], text_color="#000000"):
@@ -76,13 +76,12 @@ class ModernButton(tk.Canvas):
 class SFTPUploaderApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("SFTP Pro")
-        self.center_window(750, 1200)
+        self.root.title("SFTP Pro (V39 Split Auth)")
+        self.center_window(720, 1200)
         self.root.configure(bg=COLORS["bg"])
 
         self.use_jump = tk.BooleanVar(value=True)
         self.upload_mode = tk.StringVar(value="folder")
-        # [NEW] 强制覆盖开关
         self.force_overwrite = tk.BooleanVar(value=False)
         
         self.config_name = tk.StringVar()
@@ -167,16 +166,21 @@ class SFTPUploaderApp:
         self._add_input_row(jump_group, 1, "IP地址:", "jump_host", "")
         self._add_input_row(jump_group, 2, "用户名:", "jump_user", "")
         self._add_input_row(jump_group, 3, "密钥Key (可选):", "jump_key", "", is_file=True) 
-        self._add_input_row(jump_group, 4, "密码 (必填):", "jump_pass", "", is_password=True)
+        self._add_input_row(jump_group, 4, "密码:", "jump_pass", "", is_password=True)
         self.jump_inputs["jump_port"] = tk.Entry(self.root)
         self.jump_inputs["jump_port"].insert(0, "22")
 
         target_group = self._create_group(self.tab_setup, "目标服务器 (Target)")
         self._add_input_row(target_group, 0, "IP地址:", "target_host", "")
         self._add_input_row(target_group, 1, "用户名:", "target_user", "")
-        self._add_input_row(target_group, 2, "密钥Key (必填):", "target_key", os.path.expanduser("~/.ssh/id_rsa"), is_file=True)
-        self._add_input_row(target_group, 3, "PIN (PortalPIN):", "target_pass", "", is_password=True)
-        tk.Label(target_group, text="(非必填。若填了则PIN步骤自动输入，否则弹窗)", bg=COLORS["card"], fg=COLORS["text_dim"], font=("Arial", 8)).grid(row=4, column=1, sticky="w")
+        self._add_input_row(target_group, 2, "密钥Key (选填):", "target_key", os.path.expanduser("~/.ssh/id_rsa"), is_file=True)
+        
+        # [NEW] 拆分 静态密码 和 PortalPIN
+        self._add_input_row(target_group, 3, "密码:", "target_static_pwd", "", is_password=True)
+        self._add_input_row(target_group, 4, "PortalPIN (集群):", "target_pass", "", is_password=True)
+        
+        tk.Label(target_group, text="(普通服务器填密码；集群填PIN；动态码强制弹窗)", bg=COLORS["card"], fg=COLORS["text_dim"], font=("Arial", 8)).grid(row=5, column=1, sticky="w")
+        
         self.target_inputs["target_port"] = tk.Entry(self.root)
         self.target_inputs["target_port"].insert(0, "22")
 
@@ -213,7 +217,6 @@ class SFTPUploaderApp:
         status_frame = tk.Frame(ctrl_frame, bg=COLORS["bg"])
         status_frame.pack(pady=(0, 5), fill="x")
         
-        # 左侧：状态灯
         left_box = tk.Frame(status_frame, bg=COLORS["bg"])
         left_box.pack(side="left")
         self.status_indicator = tk.Label(left_box, text="●", fg=COLORS["stop"], bg=COLORS["bg"], font=("Arial", 16))
@@ -221,7 +224,6 @@ class SFTPUploaderApp:
         self.status_label = tk.Label(left_box, text="未连接 (Disconnected)", bg=COLORS["bg"], fg=COLORS["text_dim"], font=FONTS["status"])
         self.status_label.pack(side="left", padx=5)
         
-        # [NEW] 右侧：强制覆盖开关
         chk_overwrite = tk.Checkbutton(status_frame, text="强制覆盖 (不跳过同名文件)", variable=self.force_overwrite, 
                                      bg=COLORS["bg"], fg=COLORS["text_dim"], 
                                      selectcolor=COLORS["input_bg"], activebackground=COLORS["bg"], 
@@ -445,28 +447,53 @@ class SFTPUploaderApp:
         event.wait()
         return result["value"] if result["value"] is not None else ""
 
-    # --- 🔒 MFA Handler ---
+    # --- 🔒 MFA Handler (核心分流逻辑) ---
     def mfa_interactive_handler(self, title, instructions, prompt_list):
         self.log(f"--- 🔒 Interactive Auth Required ---", "MFA")
         resp = []
+        
+        # 获取两个框的内容
+        gui_static_pwd = self.target_inputs["target_static_pwd"].get().strip()
         gui_pin = self.target_inputs["target_pass"].get().strip()
+        
         for i, (prompt, echo) in enumerate(prompt_list):
             self.log(f"Server asks: {prompt.strip()}", "INFO")
             prompt_lower = prompt.lower()
+            
+            # 1. 动态码/OTP (最高优先级，必须弹窗)
             is_otp_request = any(x in prompt_lower for x in ["code", "verification", "otp", "microsoft", "动态"])
-            if gui_pin and (not is_otp_request):
-                self.log(f">> Auto-filled PIN/Pass (masked).", "SUCCESS")
-                resp.append(gui_pin)
-            else:
-                dialog_title = "需要输入 PIN" if not is_otp_request else "身份验证 (OTP)"
-                dialog_prompt = f"服务器提示: {prompt}\n(请输入)"
+            
+            if is_otp_request:
                 user_input = self._thread_safe_askstring(
-                    dialog_title, 
-                    dialog_prompt, 
-                    is_password=(not echo)
+                    "身份验证 (OTP)", 
+                    f"服务器提示: {prompt}\n(请输入)", 
+                    is_password=True
                 )
                 self.log(f">> Sending MANUAL input.", "WARN")
                 resp.append(user_input)
+                continue
+
+            # 2. 如果服务器明确问 "Password:" 且我们填了静态密码 -> 发送静态密码
+            if "password" in prompt_lower and gui_static_pwd and ("pin" not in prompt_lower):
+                self.log(f">> Auto-filled Static Password.", "SUCCESS")
+                resp.append(gui_static_pwd)
+                continue
+                
+            # 3. 如果服务器问 "PIN" 或者 "PortalPIN" 且我们填了 PIN -> 发送 PIN
+            if ("pin" in prompt_lower) and gui_pin:
+                self.log(f">> Auto-filled PortalPIN.", "SUCCESS")
+                resp.append(gui_pin)
+                continue
+
+            # 4. 兜底逻辑：如果无法匹配或者没填，就弹窗
+            user_input = self._thread_safe_askstring(
+                "需要输入", 
+                f"服务器提示: {prompt}\n(请输入)", 
+                is_password=(not echo)
+            )
+            self.log(f">> Sending MANUAL input.", "WARN")
+            resp.append(user_input)
+            
         return resp
 
     # --- 连接核心逻辑 ---
@@ -492,6 +519,7 @@ class SFTPUploaderApp:
         k = os.path.expanduser(k)
         auth_success = False
 
+        # 1. 尝试 Key 认证
         if k and os.path.exists(k):
             pkey = self._try_load_key(k, pwd)
             if pkey:
@@ -501,6 +529,7 @@ class SFTPUploaderApp:
                 except: 
                     self.log(f"Key rejected by {h}.", "WARN")
         
+        # 2. 尝试 静态密码 认证
         if not auth_success and not transport.is_authenticated() and pwd:
             try: 
                 transport.auth_password(u, pwd)
@@ -508,6 +537,8 @@ class SFTPUploaderApp:
             except: 
                 pass
         
+        # 3. 尝试 交互式认证 (Interactive)
+        # 这里会触发 mfa_interactive_handler，里面会根据 Prompt 智能选择填密码还是PIN
         if not transport.is_authenticated():
             try: 
                 transport.auth_interactive(u, self.mfa_interactive_handler)
@@ -534,11 +565,13 @@ class SFTPUploaderApp:
             jc = self._connect_node_generic(j['jump_host'], j['jump_port'], j['jump_user'], j['jump_key'], j['jump_pass'])
             sock = jc.get_transport().open_channel("direct-tcpip", (t['target_host'], int(t['target_port'])), (j['jump_host'], 0))
             self.log("Tunnel established. Connecting to Target...", "INFO")
-            tc = self._connect_node_generic(t['target_host'], t['target_port'], t['target_user'], t['target_key'], None, sock=sock)
+            # [关键] 这里传入 target_static_pwd 作为默认密码尝试
+            tc = self._connect_node_generic(t['target_host'], t['target_port'], t['target_user'], t['target_key'], t.get('target_static_pwd'), sock=sock)
         else:
             if not t['target_host']: raise Exception("Target Host IP missing")
             self.log(f"Direct connection to {t['target_host']}...", "INFO")
-            tc = self._connect_node_generic(t['target_host'], t['target_port'], t['target_user'], t['target_key'], None)
+            # [关键] 这里传入 target_static_pwd 作为默认密码尝试
+            tc = self._connect_node_generic(t['target_host'], t['target_port'], t['target_user'], t['target_key'], t.get('target_static_pwd'))
         return tc, jc
 
     # --- 持久化连接管理 ---
@@ -695,7 +728,6 @@ class SFTPUploaderApp:
         size = os.path.getsize(local)
         need = True
         
-        # [NEW] 如果没有勾选强制覆盖，才去检查大小
         if not self.force_overwrite.get():
             try:
                 attr = sftp.stat(remote)
@@ -751,7 +783,6 @@ class SFTPUploaderApp:
         fname = os.path.basename(remote_file)
         need = True
         
-        # [NEW] 如果没有勾选强制覆盖，才去检查大小
         if not self.force_overwrite.get():
             if os.path.exists(local_file) and os.path.getsize(local_file) == size:
                 self.log(f"Skip: {fname}", "INFO")
